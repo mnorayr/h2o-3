@@ -13,18 +13,22 @@ import java.util.concurrent.ArrayBlockingQueue;
 import static water.fvec.Vec.makeCon;
 
 public class SQLManager {
-
-
+  
+  final static String TEMP_TABLE_NAME = "table_for_h2o_import";
+  
   /**
    * @param connection_url (Input) 
    * @param table (Input)
+   * @param select_query (Input)
    * @param username (Input)
    * @param password (Input)
    * @param columns (Input)
    * @param optimize (Input)                
    */
-  public static Job<Frame> importSqlTable(final String connection_url, final String table, final String username, 
-                                          final String password, final String columns, boolean optimize) {
+  public static Job<Frame> importSqlTable(final String connection_url, String table, final String select_query,
+                                          final String username, final String password, final String columns,
+                                          boolean optimize) {
+    
     
     Connection conn = null;
     Statement stmt = null;
@@ -32,16 +36,30 @@ public class SQLManager {
 
     int catcols = 0, intcols = 0, bincols = 0, realcols = 0, timecols = 0, stringcols = 0; 
     final int numCol, maxCon; 
-    long numRow;
+    long numRow = 0;
     final String[] columnNames;
     final byte[] columnH2OTypes;
     try {
       conn = DriverManager.getConnection(connection_url, username, password);
       stmt = conn.createStatement();
-      //get number of rows
-      rs = stmt.executeQuery("SELECT COUNT(1) FROM " + table);
-      rs.next();
-      numRow = rs.getInt(1);
+      //select_query has been specified instead of table
+      if (table.equals("")) {
+        if (!select_query.toLowerCase().startsWith("select")) {
+          throw new IllegalArgumentException("The select_query must start with `SELECT`. The given select_query is: " + select_query);
+        }
+        table = SQLManager.TEMP_TABLE_NAME;
+        //returns number of rows, but as an int, not long. if int max value is exceeded, result is negative
+        numRow = stmt.executeUpdate("CREATE TABLE " + table + " AS " + select_query);
+      } else if (table.equals(SQLManager.TEMP_TABLE_NAME)) {
+        //tables with this name are assumed to be created here temporarily and are dropped
+        throw new IllegalArgumentException("The specified table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
+      }
+      //get number of rows. check for negative row count
+      if (numRow <= 0) {
+        rs = stmt.executeQuery("SELECT COUNT(1) FROM " + table);
+        rs.next();
+        numRow = rs.getLong(1);
+      }
       //get max allowed connections to database
       rs = stmt.executeQuery("SELECT @@max_connections");
       rs.next();
@@ -146,14 +164,17 @@ public class SQLManager {
     final Key destination_key = Key.make(table + "_sql_to_hex");
     final Job<Frame> j = new Job(destination_key, Frame.class.getName(), "Import SQL Table");
 
+    final String finalTable = table;
     H2O.H2OCountedCompleter work = new H2O.H2OCountedCompleter() {
       @Override
       public void compute2() {
-        Frame fr = new SqlTableToH2OFrame(connection_url, table, username, password, columns, numCol, maxCon, _v.nChunks(), j).doAll(columnH2OTypes, _v)
+        Frame fr = new SqlTableToH2OFrame(connection_url, finalTable, username, password, columns, numCol, maxCon, _v.nChunks(), j).doAll(columnH2OTypes, _v)
                 .outputFrame(destination_key, columnNames, null);
         DKV.put(fr);
         _v.remove();
         ParseDataset.logParseResults(fr);
+        if (finalTable.equals(SQLManager.TEMP_TABLE_NAME)) 
+          dropTempTable(connection_url, username, password);
         tryComplete();
       }
     };
@@ -162,7 +183,7 @@ public class SQLManager {
     return j;
   }
 
-  public static class SqlTableToH2OFrame extends MRTask<SqlTableToH2OFrame> {
+  private static class SqlTableToH2OFrame extends MRTask<SqlTableToH2OFrame> {
     final String _url, _table, _user, _password, _columns;
     final int _numCol, _nChunks, _maxCon;
     final Job _job;
@@ -234,6 +255,7 @@ public class SQLManager {
                   break;
                 case "Byte":
                   ncs[i].addNum((long) (byte) res, 0);
+                  break;
                 case "BigDecimal":
                   ncs[i].addNum(((BigDecimal) res).doubleValue());
                   break;
@@ -300,6 +322,36 @@ public class SQLManager {
       } // ignore
     }
   }
+  
+  private static void dropTempTable(String connection_url, String username, String password) {
+    Connection conn = null;
+    Statement stmt = null;
+    
+    String drop_table_query = "DROP TABLE " + SQLManager.TEMP_TABLE_NAME;
+    try {
+      conn = DriverManager.getConnection(connection_url, username, password);
+      stmt = conn.createStatement();
+      stmt.executeUpdate(drop_table_query);
+    } catch (SQLException ex) {
+      throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to execute SQL query: " + drop_table_query);
+    } finally {
+      // release resources in a finally{} block in reverse-order of their creation
+      if (stmt != null) {
+        try {
+          stmt.close();
+        } catch (SQLException sqlEx) {
+        } // ignore
+        stmt = null;
+      }
 
+      if (conn != null) {
+        try {
+          conn.close();
+        } catch (SQLException sqlEx) {
+        } // ignore
+        conn = null;
+      }
+    }
+  }
 }
 
